@@ -2,11 +2,13 @@
 #include <nccl.h>
 #include <torch/csrc/cuda/nccl.h>
 
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 1)
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 7)
 #define NCCL_HAS_SYMMEM_SUPPORT
 #endif
 
 #ifdef NCCL_HAS_SYMMEM_SUPPORT
+#include <nccl_device.h>
+#include <vector_types.h>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
@@ -35,26 +37,90 @@ struct NCCLAllocation {
 
   NCCLAllocation(void* ptr, size_t buffer_size, int device_idx)
       : ptr(ptr), buffer_size(buffer_size), device_idx(device_idx) {}
+
+  ~NCCLAllocation() {
+    // Avoid calling CUDA functions after driver shutting down
+    if (is_finalizing()) {
+      return;
+    }
+    c10::cuda::CUDAGuard guard(device_idx);
+    C10D_NCCL_CHECK(ncclMemFree(ptr), "ncclMemFree");
+  }
 };
+
+static __global__ void build_ptr_dev(
+  ncclWindow_t handle,
+  size_t       offset,      // byte offset inside the window
+  void**       table,       // [world_size] pointer table (device memory)
+  int          world_size)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int peer = 0; peer < world_size; ++peer) {
+            void* p = ncclGetLsaPointer(handle, offset, peer);
+            table[peer] = p;
+        }
+    }
+}
 
 class NCCLSymmetricMemory : public SymmetricMemory {
  public:
  NCCLSymmetricMemory(
       std::shared_ptr<NCCLAllocation> allocation,
       const std::string& group_name,
-      ncclWindow_t handle,
-      ncclWindow_t signal_handle)
+      ncclWindow_t buffer_handle,
+      ncclWindow_t signal_handle,
+      ncclDevComm devComm,
+      void* signal_pad_ptr)
       : allocation_(allocation),
         buffer_size_(allocation->buffer_size),
         device_idx_(allocation->device_idx),
         group_name_(group_name),
-        handle_(handle),
-        signal_handle_(signal_handle) {
-    c10::cuda::CUDAGuard guard(device_idx_);
+        buffer_handle_(buffer_handle),
+        signal_handle_(signal_handle),
+        devComm_(devComm){
+    // For logging only
+    static int exchanged_n_times = 0;
+    c10::cuda::CUDAGuard guard(allocation->device_idx);
 
-    // We need some API like nvshmem_extension::nvshmem_ptr()
-    // put API to get the reference of remote memory.
-    // WIP
+    auto global_rank = get_group_info("0").rank;
+    GroupInfo& group_info = get_group_info(group_name);
+    auto store = group_info.store;
+    rank_ = group_info.rank;
+    world_size_ = group_info.world_size;
+    // Exchange rank to global rank mapping for this group.
+    // If it is already available, skip the exchange.
+    if (group_info.rank_to_global_rank.empty()) {
+      group_info.rank_to_global_rank =
+          storeExchange.all_gather(store, rank_, world_size_, global_rank);
+      exchanged_n_times++;
+      if (rank_ == 0) {
+        LOG(INFO) << "[rank " << rank_ << ']'
+                  << " rank_to_global_rank: " << group_info.rank_to_global_rank
+                  << ", group_name: " << group_name
+                  << ", exchanged_n_times: " << exchanged_n_times;
+      }
+    }
+
+    TORCH_INTERNAL_ASSERT(!group_info.rank_to_global_rank.empty());
+    rank_to_global_rank_ = group_info.rank_to_global_rank;
+
+    const size_t arr_size = sizeof(void*) * world_size_;
+    buffers_dev_ = reinterpret_cast<void**>(
+        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
+    signal_pads_dev_ = reinterpret_cast<void**>(
+        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
+
+    build_ptr_dev<<<1, 1>>>(buffer_handle, 0, buffers_dev_, world_size_);
+    build_ptr_dev<<<1, 1>>>(signal_handle, 0, signal_pads_dev_, world_size_);
+    cudaDeviceSynchronize();
+
+    rank_to_global_rank_dev_ = reinterpret_cast<int*>(
+        c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(int) * world_size_));
+    AT_CUDA_CHECK(cudaMemcpy(
+        rank_to_global_rank_dev_,
+        rank_to_global_rank_.data(),
+        sizeof(int) * world_size_,
+        cudaMemcpyHostToDevice));
   }
 
   ~NCCLSymmetricMemory() override = default;
@@ -117,13 +183,25 @@ class NCCLSymmetricMemory : public SymmetricMemory {
     return c10::Device(c10::DeviceType::CUDA, device_idx_);
   }
 
-  virtual std::vector<int>& get_rank_to_global_rank() override {
+  const std::vector<int>& get_rank_to_global_rank() override {
     return rank_to_global_rank_;
   };
 
   int* get_rank_to_global_rank_dev() override {
     return rank_to_global_rank_dev_;
   };
+
+  ncclWindow_t get_buffer_handle() {
+    return buffer_handle_;
+  }
+
+  ncclWindow_t get_signal_pad_handle() {
+    return signal_handle_;
+  }
+
+  ncclDevComm get_nccl_dev_comm() {
+    return devComm_;
+  }
 
  private:
   std::shared_ptr<NCCLAllocation> allocation_;
@@ -137,8 +215,9 @@ class NCCLSymmetricMemory : public SymmetricMemory {
   void** buffers_dev_;
   void** signal_pads_dev_;
   std::string group_name_;
-  ncclWindow_t handle_;
+  ncclWindow_t buffer_handle_;
   ncclWindow_t signal_handle_;
+  ncclDevComm devComm_;
 
   std::vector<int> rank_to_global_rank_;
   int* rank_to_global_rank_dev_;
@@ -240,8 +319,17 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         " on ncclComm_ ",
         comm));
 
+    // Create device communicator
+    ncclDevComm devComm;
+    ncclDevCommRequirements reqs;
+    memset(&reqs, 0, sizeof(ncclDevCommRequirements));
+    // TODO: we need to figure out how to set the number of CTA and requirements.
+    int nCTAs = 16;
+    reqs.lsaBarrierCount = nCTAs;
+    C10D_NCCL_CHECK(ncclDevCommCreate(comm, &reqs, &devComm), "ncclDevCommCreate failed");
+
     auto symm_mem =
-        c10::make_intrusive<NCCLSymmetricMemory>(alloc, *group_name, std::move(handle), std::move(signal_handle));
+        c10::make_intrusive<NCCLSymmetricMemory>(alloc, *group_name, std::move(handle), std::move(signal_handle), std::move(devComm), std::move(signal_pad_ptr));
 
     symm_mems_[std::make_tuple(ptr, *group_name)] = symm_mem;
     return symm_mem;
